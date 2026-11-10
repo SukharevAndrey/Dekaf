@@ -559,6 +559,35 @@ public sealed class TransactionTests
     }
 
     /// <summary>
+    /// Covers the fenced-response rule shared by librdkafka 0105 do_test_txn_fenced_reinit:
+    /// an InitProducerId rejected with a fenced identity is fatal. This exercises response
+    /// classification and the fatal transition, not the full reinit workflow. The producer must
+    /// report the broker's error as a fatal transaction failure and must not retry the request or
+    /// continue as if initialization had succeeded.
+    /// </summary>
+    [Test]
+    [Arguments(ErrorCode.InvalidProducerEpoch)]
+    [Arguments(ErrorCode.ProducerFenced)]
+    public async Task InitTransactionsAsync_FencedInitProducerId_MarksProducerFatalWithoutRetrying(
+        ErrorCode errorCode)
+    {
+        await using var harness = BuildPreparedCompletionHarness(
+            PreparedTransactionState.Empty,
+            currentProducerId: 2002,
+            currentProducerEpoch: 9,
+            initProducerIdErrors: new Queue<ErrorCode>([errorCode]));
+        harness.Producer._transactionState = TransactionState.Ready;
+
+        var exception = await Assert.That(() => harness.Producer.InitTransactionsAsync().AsTask())
+            .Throws<FatalTransactionException>();
+
+        await Assert.That(exception!.ErrorCode).IsEqualTo(errorCode);
+        await Assert.That(harness.Producer._transactionState).IsEqualTo(TransactionState.FatalError);
+        await Assert.That(harness.Producer._lastTransactionError).IsEqualTo(errorCode);
+        await Assert.That(harness.InitProducerIdRequests).IsEqualTo(1);
+    }
+
+    /// <summary>
     /// A fatal control-plane answer (here an EndTxn whose outcome is unknown) races a caller's
     /// abortable transition. Whatever the interleaving, the producer must end fatal: the abortable
     /// transition must never overwrite a fatal state written concurrently.
@@ -3261,6 +3290,7 @@ public sealed class TransactionTests
         Queue<Exception>? connectionFailures = null,
         Queue<Exception>? findCoordinatorFailures = null,
         Queue<Exception>? initProducerIdFailures = null,
+        Queue<ErrorCode>? initProducerIdErrors = null,
         Queue<Exception>? addPartitionsFailures = null,
         Queue<Exception>? endTxnFailures = null,
         bool endTxnFailsAfterWrite = false,
@@ -3297,6 +3327,7 @@ public sealed class TransactionTests
             initProducerIdAdvanceMs: initProducerIdAdvanceMs,
             findCoordinatorFailures: findCoordinatorFailures,
             initProducerIdFailures: initProducerIdFailures,
+            initProducerIdErrors: initProducerIdErrors,
             addPartitionsFailures: addPartitionsFailures,
             endTxnFailures: endTxnFailures,
             endTxnFailsAfterWrite: endTxnFailsAfterWrite,
@@ -3612,7 +3643,8 @@ public sealed class TransactionTests
         int endTxnAdvanceMs,
         ErrorCode findCoordinatorError,
         bool endTxnFailsAfterCancellation,
-        bool findCoordinatorFailsAfterCancellation) : IKafkaConnection, IRetirableKafkaConnection,
+        bool findCoordinatorFailsAfterCancellation,
+        Queue<ErrorCode>? initProducerIdErrors) : IKafkaConnection, IRetirableKafkaConnection,
         IKafkaPipelinedWriteCompletionConnection, IKafkaRequestWriteObserverConnection
     {
         /// <summary>
@@ -3874,6 +3906,16 @@ public sealed class TransactionTests
             BeforeInitProducerIdResponse?.Invoke();
             InitProducerIdRequests++;
             transactionClock?.Advance(initProducerIdAdvanceMs);
+            if (initProducerIdErrors is { Count: > 0 })
+            {
+                return new InitProducerIdResponse
+                {
+                    ErrorCode = initProducerIdErrors.Dequeue(),
+                    ProducerId = -1,
+                    ProducerEpoch = -1
+                };
+            }
+
             return new InitProducerIdResponse
             {
                 ErrorCode = InitProducerIdRequests <= initProducerIdRetriableFailuresBeforeSuccess
