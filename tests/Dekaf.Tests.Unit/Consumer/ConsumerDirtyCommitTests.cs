@@ -101,6 +101,43 @@ public sealed partial class ConsumerDirtyCommitTests
     }
 
     [Test]
+    public async Task CommitAsync_WhenBrokerAnswersUnknownMemberId_ThrowsNonRetriableWithoutRetrying()
+    {
+        // librdkafka 0148 do_test_OffsetCommit_manual_error: a manual commit returns the
+        // broker's partition-level membership error to the caller. UNKNOWN_MEMBER_ID means the
+        // member was evicted, so resending the same request cannot succeed: the commit must
+        // surface it once, non-retriable, and leave the offsets dirty for the attempt after the
+        // consumer polls and rejoins.
+        var requests = new List<OffsetCommitRequest>();
+        await using var consumer = CreateConsumer(
+            requests,
+            new Queue<ErrorCode>([ErrorCode.UnknownMemberId, ErrorCode.None]));
+        consumer.Seek(new TopicPartitionOffset("topic-a", 0, 10));
+
+        var exception = await Assert.That(async () => await consumer.CommitAsync(CancellationToken.None))
+            .Throws<GroupException>();
+
+        await Assert.That(exception!.ErrorCode).IsEqualTo(ErrorCode.UnknownMemberId);
+        await Assert.That(exception.IsRetriable).IsFalse();
+        await Assert.That(requests).Count().IsEqualTo(1);
+        await Assert.That(GetCommittedOffsets(requests[0])).IsEquivalentTo(
+        [
+            new TopicPartitionOffset("topic-a", 0, 10)
+        ]);
+
+        // The failure must not clear the dirty offset: the next attempt resends the same
+        // offset. The fixture answers that attempt with success; this pins error propagation
+        // and dirty retention, not the poll/rejoin that must precede a real retry.
+        await consumer.CommitAsync(CancellationToken.None);
+
+        await Assert.That(requests).Count().IsEqualTo(2);
+        await Assert.That(GetCommittedOffsets(requests[1])).IsEquivalentTo(
+        [
+            new TopicPartitionOffset("topic-a", 0, 10)
+        ]);
+    }
+
+    [Test]
     public async Task CommitAsync_Parameterless_UsesDefaultApiTimeout()
     {
         var requests = new List<OffsetCommitRequest>();
