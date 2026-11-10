@@ -555,6 +555,100 @@ public sealed class BrokerSenderEpochRecoveryTests : ScriptedProduceResponseFixt
     }
 
     [Test]
+    public async Task AmbiguousRetry_AnsweredDuplicateSequenceNumber_AcksThePersistedBatch_AndContinuesItsSequence(
+        CancellationToken cancellationToken)
+    {
+        // librdkafka 0144 do_test_idempo_duplicate_sequence_number_after_possibly_persisted:
+        // the first attempt's response is lost, so the broker may have stored the batch. The
+        // retry is answered DuplicateSequenceNumber, which says it did. The delivery must
+        // succeed, the retry must keep the batch's original stamp, and the next batch must
+        // continue after its records under the same epoch. Sending the retry as a new sequence
+        // could let the broker append the records twice; bumping the epoch and restarting the
+        // partition at sequence 0 can make it treat the fresh batch as a duplicate of the one it
+        // already stored and drop it. Treating the duplicate as a failure would fail a record the
+        // broker persisted. The broker is scripted: this pins the sender's response handling, not
+        // broker-side exactly-once behavior.
+        var responseLost = NewResponseSource();
+        var duplicate = NewResponseSource();
+        var next = NewResponseSource();
+        var (pool, connection) = CreateMockConnection(
+            new Queue<TaskCompletionSource<ProduceResponse>>([responseLost, duplicate, next]));
+        connection.CaptureProduceRequests = true;
+        cancellationToken = GuardUnscriptedSends(cancellationToken);
+        var options = CreateOptions();
+        var accumulator = new RecordAccumulator(options);
+        var valueTaskSourcePool = new ValueTaskSourcePool<RecordMetadata>();
+        var state = new ProducerStateHolder(new ProducerIdAndEpoch(1234, 5));
+        accumulator.PublishProducerState(state.Value);
+        var bumpRequests = new List<short>();
+        var sender = CreateSender(
+            pool, options, accumulator, (_, _, _, _, _) => { },
+            bumpEpoch: LocalBump(accumulator, bumpRequests, state),
+            getProducerState: () => state.Read());
+
+        try
+        {
+            var (batch, delivery) = CreateTrackedBatch(
+                valueTaskSourcePool, Partition0, producerId: 1234, producerEpoch: 5, recordCount: 2);
+            sender.Enqueue(batch);
+            await WaitUntilAsync(
+                () => Volatile.Read(ref connection.SendPipelinedAfterWriteCalls) == 1,
+                cancellationToken);
+
+            // The broker may have stored the batch, but its response never arrives.
+            responseLost.SetException(new IOException("connection reset"));
+            await WaitUntilAsync(
+                () => Volatile.Read(ref connection.SendPipelinedAfterWriteCalls) == 2,
+                cancellationToken);
+
+            duplicate.SetResult(CreateErrorResponse(Topic, 0, ErrorCode.DuplicateSequenceNumber));
+            await delivery.WaitAsync(cancellationToken);
+
+            (long ProducerId, short ProducerEpoch, int BaseSequence)[] attempts;
+            lock (connection.CapturedProduceRequests)
+                attempts = connection.CapturedProduceRequests
+                    .SelectMany(static request => request.ProducerStamps)
+                    .ToArray();
+            await Assert.That(attempts).IsEquivalentTo([(1234L, (short)5, 0), (1234L, (short)5, 0)]);
+
+            // The duplicate counts as the persisted record: the partition's counter stays after
+            // its two records instead of restarting at 0 under the same epoch (where the broker
+            // could deduplicate the fresh batch as the one it already holds) or skipping ahead.
+            var (nextBatch, nextDelivery) = CreateTrackedBatch(
+                valueTaskSourcePool, producerId: 1234, producerEpoch: 5);
+            sender.Enqueue(nextBatch);
+            await WaitUntilAsync(
+                () => connection.CapturedProduceRequestCount == 3,
+                cancellationToken);
+
+            (long ProducerId, short ProducerEpoch, int BaseSequence)[] nextStamps;
+            lock (connection.CapturedProduceRequests)
+                nextStamps = connection.CapturedProduceRequests[2].ProducerStamps.ToArray();
+            await Assert.That(nextStamps).IsEquivalentTo([(1234L, (short)5, 2)]);
+
+            next.SetResult(CreateSuccessResponse(Topic, 0, baseOffset: 44));
+            await nextDelivery.WaitAsync(cancellationToken);
+
+            short[] observedBumps;
+            lock (bumpRequests)
+                observedBumps = bumpRequests.ToArray();
+            await Assert.That(observedBumps).IsEmpty();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Assert.Fail(
+                $"A wait was cancelled before the send loop got there. Requests written so far:{Environment.NewLine}" +
+                DescribeRequests(connection));
+        }
+        finally
+        {
+            await sender.DisposeAsync();
+            await accumulator.DisposeAsync();
+            await valueTaskSourcePool.DisposeAsync();
+        }
+    }
+
+    [Test]
     public async Task LeaderMoveDuringBump_NewLeaderHoldsRestart_UntilReroutedOldEpochBatchIsAnswered(CancellationToken cancellationToken)
     {
         // Regression for #3385. Partition 1's epoch 5 request is pending on broker 1 when a
